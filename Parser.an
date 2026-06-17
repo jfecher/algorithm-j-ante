@@ -1,0 +1,105 @@
+import Std.Fail.Fail, fail, on_fail, try
+import Std.Char.is_alpha
+import Std.String.eq_string
+import AParse.Parse.Parse, mark, reset, char_parser, literal, take_while1, optional, many1, fold1
+import AParse.Parse.map, keep_right, between, or_else, token, parse
+
+shared type Expr =
+   | Unit
+   | Identifier String
+   | Lambda String Expr
+   | FnCall Expr Expr
+   | Let String Expr Expr
+
+is_ident_char c = is_alpha c or c == '_'
+
+/// `let` and `in` are reserved words, so they never parse as identifiers.
+is_reserved (s: ref String): Bool =
+    s == "let" or s == "in"
+
+/// An identifier: one or more identifier characters, excluding reserved words.
+ident {Fail} {Parse}: String =
+    parser = token (take_while1 is_ident_char)
+    word = parser ()
+    if is_reserved word then fail ()
+    word
+
+/// Match keyword `kw` as a whole token.
+keyword (kw: String) =
+    token (literal kw)
+
+/// Match the single symbol `c` as a token.
+symbol (c: Char) =
+    token (char_parser c)
+
+/// atom := "()" | '(' term ')' | ident
+atom =
+    unit_expr = map (keyword "()") (do Expr.Unit)
+    paren = between (symbol '(') (symbol ')') term
+    variable = map ident Expr.Identifier
+    unit_expr |> or_else paren |> or_else variable
+
+/// app := atom atom*
+app = fold1 atom FnCall
+
+/// lambda := ident '.' term
+///         | ident lambda
+/// `\x y z. body` curries into `Lambda x (Lambda y (Lambda z body))`.
+lambda {Fail} {Parse}: Expr =
+    name = ident ()
+    body_parser = keep_right (symbol '.') term |> or_else lambda
+    body = body_parser ()
+    Expr.Lambda name body
+
+/// term := app | '\' lambda | let
+/// FIXME: This breaks when not defined as a function and returning `parse_let |> or_else ...` directly
+/// NOTE: The above is because `term` is recursive. Could use a better error.
+term {Fail} {Parse} =
+    lam_expr = keep_right (symbol '\\') lambda
+    parser = parse_let |> or_else lam_expr |> or_else app
+    parser ()
+
+/// let := "let" ident '=' term "in" term
+parse_let {Fail} {Parse}: Expr =
+    let = keyword "let"
+    let ()
+    name = ident ()
+    eq = symbol '='
+    eq ()
+    value = term ()
+    in_kw = keyword "in"
+    in_kw ()
+    body = term ()
+    Expr.Let name value body
+
+// ---------------------------------------------------------------------------
+// Pretty-printing
+// ---------------------------------------------------------------------------
+show_expr (e: Expr): String =
+    match e
+    | Unit -> "()"
+    | Identifier s -> s
+    | Lambda x body -> "(\\" ++ x ++ ". " ++ show_expr body ++ ")"
+    | FnCall f a -> "(" ++ show_expr f ++ " " ++ show_expr a ++ ")"
+    | Let x value body -> "let " ++ x ++ " = " ++ show_expr value ++ " in " ++ show_expr body
+
+impl print_expr: Print Expr with
+    print (e: Expr) = print (show_expr e)
+
+// ---------------------------------------------------------------------------
+parse_expr (text: String) {Fail}: Expr =
+    parse term text
+
+show_parse (text: String): Unit =
+    output = show_expr (parse_expr (clone text)) ~> on_fail do "parse error"
+    print text
+    print "  ==>  "
+    println output
+
+main () =
+    show_parse "\\x.x"
+    show_parse "let id = \\x.x in id id"
+    show_parse "\\x y z. x"
+    show_parse "(\\x. x) y"
+    show_parse "let compose = \\f g x. f (g x) in compose"
+    show_parse "let x = y"   // error: missing `in`

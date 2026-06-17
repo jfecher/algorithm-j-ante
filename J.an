@@ -1,0 +1,313 @@
+//  This implementation follows the type inference rules given at
+//  https://en.wikipedia.org/wiki/Hindley%E2%80%93Milner_type_system#Algorithm_J
+//
+//  The algorithm itself uses most of the names from the above link, with
+//  a few changed for ease of typing:
+//       Γ (gamma) => env
+//       ⊢ⱼ (perpendicular symbol with j subscript, a.k.a. algorithm J) => infer
+//       Γ¯ (gamma bar) => generalize
+//
+//  And some expr constructors changed to match their more colloquial names
+//  to hopefully make this somewhat more approachable:
+//       Var => Identifier
+//       App => FnCall
+//       Abs => Lambda
+//
+//  Note that a let-binding (or Declaration here) can be of either
+//  a variable or a function
+//
+//  Additionally, implementation of "levels" for efficient generalization is
+//  taken from http://okmij.org/ftp/ML/generalization.html
+import Std.Vec.Vec, stream_vec
+import Local.Parser.Expr
+import Std.HashMap.HashMap
+import Std.Fail.on_fail, Fail, fail
+import Std.Stream.stream_fn, map, Emit, emit
+import Std.Throw.Throw, throw
+
+type TypeVarId = U32
+type Level = U32
+
+shared type Type =
+    // unit type
+    | Unit
+
+    // 'a, 'b, etc.
+    // A reference to a bound or unbound typevar, set during unification.
+    // This is unique to algorithm J where mutation is needed to remember
+    // some substitutions.
+    // The level of this typevar identifies how many let-bindings deep it was
+    // declared in. This is used to prevent generalization of typevars that
+    // escape outside the current let-binding scope.
+    | Var TypeVar
+
+    // 'a -> 'b, all functions are single-argument only
+    // e.g. \a b c.c  is automatically translated to \a.\b.\c.c
+    // Currying is also automatic
+    | Fn Type Type
+
+shared type TypeVar =
+    | Bound Type
+    | Unbound TypeVarId Level
+
+// Polytypes in the form  forall 'a 'b ... 'y . 'z
+// The typevar list will be a list of all monomorphic typevars in 'z
+// Used only in let-bindings to make the declaration polymorphic
+type PolyType =
+    vars: Vec TypeVarId
+    typ: Type
+
+shared type Context =
+    current_level: U32 // = 1
+    current_typevar: U32 // = 0
+
+enter_level {var ctx: Context} =
+    ctx.current_level += 1
+
+exit_level {var ctx: Context} =
+    ctx.current_level -= 1
+
+newvar {var ctx: Context} =
+    ctx.current_typevar += 1
+    ctx.current_typevar
+
+newvar_t {ctx: Context} =
+    Type.Var (Unbound (newvar ()) ctx.current_level)
+
+
+type TypeError = unit: Unit
+
+// specializes the polytype s by copying the term and replacing the
+// bound type variables consistently by new monotype variables
+// E.g.   inst (forall a b. a -> b -> a) = c -> d -> c
+inst (polytype: PolyType) {Context}: Type =
+    // Replace any typevars found in the Hashtbl with the
+    // associated value in the same table, leave them otherwise
+    replace_tvs tbl typ = match typ
+        | Type.Unit -> Type.Unit
+        | Var (Bound t) -> replace_tvs tbl t
+        | Var (Unbound n level) ->
+            typ = HashMap.get tbl n ~> on_fail do ref typ
+            typ.*
+        | Fn a b -> Fn (replace_tvs tbl a) (replace_tvs tbl b)
+
+    // Note that the returned type is no longer a PolyType,
+    // this means it is now monomorphic, the 'forall' is gone.
+    var tvs_to_replace = HashMap.empty ()
+    tvs_to_replace = HashMap.of (map polytype.vars do newvar_t ())
+    replace_tvs tvs_to_replace polytype.typ
+
+
+// Can a monomorphic TVar(a) be found inside this type?
+occurs a_id a_level typ =
+    match typ
+    | Type.Unit -> false
+    | Var (Bound t) -> occurs a_id a_level t
+    | Var (Unbound b_id b_level) -> // TODO: How to mutate with `@ b_typevar`
+        min_level = min a_level b_level
+        b_typevar := Unbound (b_id, min_level)
+        a_id == b_id
+
+    | Fn b c -> occurs a_id a_level b or occurs a_id a_level c
+
+
+unify (t1: Type) (t2: Type) {Context} {Fail}: Unit =
+    match t1, t2
+    | (Unit, Unit) -> ()
+
+    // These two recursive calls to the bound typevar replace
+    // the 'find' in the union-find algorithm
+    | Var (Bound a), b -> unify a b
+    | a, Var (Bound b) -> unify a b
+
+    | TVar (Unbound a_id a_level as a), b ->
+        // create binding for boundTy that is currently empty
+        if t1 == t2 then () // a = a, but dont create a recursive binding to itself
+        else if occurs a_id a_level b then fail ()
+        else a := Bound b
+
+    | a, TVar (Unbound b_id b_level as b) ->
+        // create binding for boundTy that is currently empty
+        if t1 == t2 then ()
+        else if occurs b_id b_level a then fail ()
+        else b := Bound a
+
+    | Fn a b, Fn c d ->
+        unify a c
+        unify b d
+
+    | _ -> fail ()
+
+
+// Find all typevars and wrap the type in a PolyType
+// e.g.  generalize (a -> b -> b) = forall a b. a -> b -> b
+generalize (t: Type) {ctx: Context}: PolyType =
+    // collect all the monomorphic typevars
+    find_all_tvs typ {Emit TypeVarId} =
+        match typ
+        | Type.Unit -> ()
+        | Var (Bound t) -> find_all_tvs t
+        | Var (Unbound n level) ->
+            if level > ctx.current_level then emit n
+        | Fn a b ->
+            find_all_tvs a
+            find_all_tvs b
+
+    var vars = Vec.of (do find_all_tvs t)
+    vars.sort_dedup ()
+    PolyType vars t
+
+
+// For the Abs/Lambda rule, parameter types need to be stored in
+// our polytype map, though parameters shouldn't be generalized
+// since their types shouldn't change (be instantiated) within the function.
+// This helper function performs the conversion while making that explicit.
+dont_generalize (t: Type): PolyType =
+    PolyType (Vec.empty ()) t
+
+
+// The main entry point to type inference
+// All branches (except for the trivial Unit) of the first match in this function
+// are translated directly from the rules for algorithm J, given in comments
+// infer : polytype SMap.t -> Expr -> Type
+infer env expr {Fail} {Context} =
+    match expr
+    | Expr.Unit -> Type.Unit
+
+    // Var
+    //   x : s ∊ env
+    //   t = inst s
+    //   -----------
+    //   infer env x = t
+    | Identifier x ->
+        s = HashMap.get env x
+        t = inst s
+        t
+
+    // App
+    //   infer env f = t0
+    //   infer env x = t1
+    //   t2 = newvar ()
+    //   unify t0 (t1 -> t2)
+    //   ---------------
+    //   infer env (f x) = t2
+    | FnCall f x ->
+        t0 = infer env f
+        t1 = infer env x
+        t2 = newvar_t ()
+        unify t0 (Fn t1 t2)
+        t2
+
+    // Abs
+    //   t = newvar ()
+    //   infer (SMap.add x t env) e = t2
+    //   -------------
+    //   infer env (fun x -> e) = t -> t2
+    | Lambda x e ->
+        t = newvar_t ()
+        // t must be a polytype to go in our map, so make an empty forall
+        env2 = SMap.add x (dont_generalize t) env
+        t2 = infer env2 e
+        Fn(t, t2)
+
+    // Let
+    //   infer env e0 = t
+    //   infer (SMap.add x (generalize t) env) e1 = t2
+    //   -----------------
+    //   infer env (let x = e0 in e1) = t2
+    //
+    // enter/exit_level optimizations are from 
+    // http://okmij.org/ftp/ML/generalization.html
+    // In this implementation, they're required so we
+    // don't generalize types that escape into the environment.
+    | Let x e0 e1 ->
+        enter_level ()
+        t = infer env e0
+        exit_level ()
+        t2 = infer (SMap.add x (generalize t) env) e1
+        t2
+
+
+///////////////////////////////////////////////////////////////////////////////
+//                     front-end for parsing exprs on
+//                      the command line and showing
+//                           their computed types
+///////////////////////////////////////////////////////////////////////////////
+
+// Return the next unique lowercase-letter string after the given one, e.g: *)
+//   next_letter "'a" = "'b"
+//   next_letter "'b" = "'c"
+//   next_letter "'z" = "'{"   This can be fixed but most examples shouldn't have > 26 typevars anyway
+//
+next_letter (s: String) =
+    c = Bytes.get s 1 in
+    Bytes.set s 1 (Char (U8 c + 1))
+
+
+// If this type is the a in a -> b, should it be parenthesized?
+// Note this is recursive in case bound typevars are used
+should_parenthesize typ =
+    match typ
+    | Type.Var (Bound t) -> should_parenthesize t
+    | Fn _ _ -> true
+    | _ -> false
+
+
+// pretty printing types
+string_of_type (t: Typ): String =
+    // Keep track of number to character bindings for typevars
+    // e.g. '2 => 'a, '5 => 'b, etc.
+    // Letters are assigned to typevars by the order in which the typevars
+    // appear in the type, left to right
+    loop (cur_typevar_name = "'a") (typevar_name_tbl = HashMap.empty ()) t ->
+        match t
+        | Type.Unit -> "unit"
+        | Var (Bound t2) -> recur cur_typevar_name typevar_name_tbl t2
+        | Var (Unbound n _) ->
+            match HashMap.get typevar_name_tbl n ~> try with
+            | Some s -> s
+            | None ->
+                typevar_name_tbl.insert n cur_typevar_name
+                next_letter cur_typevar_name
+                s
+        | Fn a b ->
+            a_str = recur cur_typevar_name typevar_name_tbl a
+            b_str = recur cur_typevar_name typevar_name_tbl b
+            if should_parenthesize a then "(${a_str}) -> ${b_str}"
+            else "${a_str} -> ${b_str}"
+
+print_type t =
+    print (string_of_type t)
+
+
+// The classic read-eval-printline-loop
+main () =
+    implicit ctx = Context with current_typevar = 0, current_level = 1
+    // TODO: throw type errors, variable not found errors, and parsing errors then convert this block
+    (try
+        print_string "> "
+        read_line ()
+        |> Lexer.parse
+        |> infer SMap.empty
+        |> print_type;
+        print_string "\n"
+    with
+       | TypeError -> print_endline "type error"
+       | Not_found -> print_endline "variable not found"
+       | Failure(s) -> print_endline "lexing failure, invalid symbol");
+    current_typevar := 0;
+    main ()
+
+// Tests
+// 
+// 1:    \f.\x. f x  :  (a -> b) -> a -> b
+// 2:    \f.\x. f (f x) : (a -> a) -> a -> a
+// (+):  \m.\n.\f.\x. m f (n f x)  :  (a -> b -> c) -> (a -> d -> b) -> a -> d -> c
+// succ: \n.\f.\x. f (n f x)  :  ((a -> b) -> c -> a) -> (a -> b) -> c -> b
+// mult: \m.\n.\f.\x. m (n f) x  :  (a -> b -> c) -> (d -> a) -> d -> b -> c
+// pred: \n.\f.\x. n (\g.\h. h (g f)) (\u.x) (\u.u)  :  (((a -> b) -> (b -> c) -> c) -> (d -> e) -> (f -> f) -> g) -> a -> e -> g
+// 
+// Let generalization tests
+// 
+// \x. let y = x in y      : 'a -> 'a
+// \x. let y = \z.x in y   : 'a -> 'b -> 'a

@@ -1,0 +1,212 @@
+//! A small parser-combinator library where each parser is a function taking a Fail
+//! and a Parse ability:
+//!
+//! ```
+//! fn {Fail} {Parse} => a
+//! ```
+import Std.Fail.Fail, fail, try
+import Std.Char.is_whitespace
+import Std.String.substr, chars
+import Std.Vec.Vec, empty, push
+import Std.Stream.foldl, stream_fn
+
+export Parse, mark, reset, succeed, satisfy, char_parser, literal, take_while1,
+    spaces, map, bind, pair, or_else, optional, many, many1, fold, fold1,
+    between, token, parse, keep_left, keep_right
+
+ability Parse =
+    // The character at the current position, or `None` at end of input
+    peek: fn Unit -> Maybe Char
+    // Consume the current character
+    advance: fn Unit -> Unit
+    // Save the current position, for backtracking or slicing
+    mark: fn Unit -> U32
+    // Restore a previously-saved position
+    reset: fn U32 -> Unit
+    // The text from the given mark up to the current position
+    slice: fn U32 -> String
+
+/// This type alias unfortunately requires us to explicitly specify function environments
+type Parser t env = fn {Fail} {Parse} [env] -> t
+
+/// Always succeed with `x`, consuming no input.
+succeed (x: a) =
+    fn {Fail} {Parse} -> x
+
+/// Consume a single character if it satisfies `pred`, otherwise fail.
+satisfy (pred: fn Char => Bool) =
+    fn {Fail} {Parse} ->
+        match peek ()
+        | Some c ->
+            if not (pred c) then fail ()
+            advance ()
+            c
+        | None -> fail ()
+
+/// Match exactly the character `expected`.
+char_parser (expected: Char) =
+    satisfy (fn c -> c == expected)
+
+/// Match the exact literal string `s`, returning it on success.
+literal (s: String) =
+    move fn {Fail} {Parse} ->
+        start = mark ()
+        // Should there be a primitive for "continue until fail or stream is exhausted?"
+        matcher {f: Fail} = chars s |> foldl () fn _ expected ->
+            if peek () is Some c and c == expected
+            then advance ()
+            else f.fail ()
+
+        if try matcher is None then
+            reset start
+            fail ()
+        s
+
+/// Consume zero or more characters satisfying `pred`. Never fails.
+consume_while (pred: fn Char => Bool) {Parse}: Unit =
+    while 
+        cond = peek () is Some c and pred c
+        if cond then advance ()
+        cond
+    do ()
+
+/// Consume one or more characters satisfying `pred`, returning the matched
+/// substring. Fails if the first character does not satisfy `pred`.
+take_while1 (pred: fn Char => Bool) =
+    fn {Fail} {Parse} ->
+        start = mark ()
+        consume_while pred
+        text = slice start
+        if text.length == 0 then fail ()
+        text
+
+/// Skip zero or more whitespace characters. Never fails.
+spaces {Fail} {Parse} = consume_while is_whitespace
+
+/// Transform a parser's result with `f`.
+map (p: Parser a env) (f: fn a => b) =
+    fn {Fail} {Parse} -> f (p ())
+
+/// Monadic sequencing: run `p`, feed its result to `f` to obtain the next
+/// parser, and run that.
+bind (p: Parser a env1) (f: fn a => Parser b env2) =
+    fn {Fail} {Parse} ->
+        data = p ()
+        next = f data
+        next ()
+
+/// Run `p` then `q`, returning both results as a pair.
+pair (p: Parser a env1) (q: Parser b env2) =
+    fn {Fail} {Parse} -> p (), q ()
+
+/// Try `p`; if it fails, `reset` to the starting position and run `q` instead.
+/// Unlike the value-threaded design, the shared position is mutated by a failed
+/// attempt, so backtracking must explicitly `mark`/`reset`.
+or_else (p: Parser a env1) (q: Parser a env2) =
+    fn {Fail} {Parse} ->
+        saved = mark ()
+        match try (p {_})
+        | Some result -> result
+        | None ->
+            reset saved
+            q ()
+
+/// Run `p`, returning `Some x` on success or `None` (without failing) otherwise.
+optional (p: Parser a env) =
+    fn {Fail} {Parse} ->
+        saved = mark ()
+        match try (p {_})
+        | Some result -> Maybe.Some result
+        | None ->
+            reset saved
+            Maybe.None
+
+/// Apply `p` zero or more times, collecting results into a `Vec`. Never fails.
+/// Stops if `p` ever succeeds without consuming input.
+many (p: Parser a env) =
+    fn {Fail} {Parse} ->
+        var acc = Vec.empty ()
+        loop () ->
+            before = mark ()
+            match try (p {_})
+            | Some result ->
+                acc.push result
+                after = mark ()
+                if after == before then ()
+                else recur ()
+            | None -> reset before
+        acc
+
+/// Apply `p` zero or more times, applying `f` to the result each time. Never fails.
+fold (p: Parser t env) (init: r) (f: fn r t => r) =
+    fn {Fail} {Parse} ->
+        loop (acc = init) ->
+            parser = optional p
+            match parser ()
+            | Some result -> recur (f acc result)
+            | None -> acc
+
+/// Apply `p` one or more times, applying `f` to the result each time.
+/// Fails if `p` doesn't parse at least one time.
+fold1 (p: Parser a env) (f: fn a a => a) =
+    fn {Fail} {Parse} ->
+        init = p ()
+        parser = fold p init f
+        parser ()
+
+/// Apply `p` one or more times, collecting results into a `Vec`.
+/// Fails if `p` does not match at least once.
+many1 (p: Parser a env) =
+    fn {Fail} {Parse} ->
+        repeated = many p
+        result = repeated ()
+        if result.len == 0 then fail ()
+        result
+
+/// Parse `p` surrounded by `open` and `close`, returning `p`'s result.
+between (open: Parser o env1) (close: Parser c env2) (p: Parser a env3) =
+    fn {Fail} {Parse} ->
+        open ()
+        result = p ()
+        close ()
+        result
+
+keep_left (left: Parser a env1) (right: Parser b env2) =
+    fn {Fail} {Parse} ->
+        result = left ()
+        right ()
+        result
+
+keep_right (left: Parser a env1) (right: Parser b env2) =
+    fn {Fail} {Parse} ->
+        left ()
+        right ()
+
+/// Run `p`, then skip any trailing whitespace - turning a "raw" parser into a
+/// whitespace-insensitive token parser.
+token (p: Parser a env) =
+    keep_left p spaces
+
+/// Run parser `p` over the whole of `text`. Leading whitespace is skipped and
+/// the parser must consume all input, otherwise it fails.
+parse (p: Parser a env) (text: String) {Fail}: a =
+    var pos = 0
+    handler h for
+    | peek () ->
+        if pos >= text.length then resume (Maybe.None)
+        else resume (Maybe.Some (text.data.[Usz pos]))
+    | advance () ->
+        pos += 1
+        resume ()
+    | mark () -> resume pos
+    | reset saved ->
+        pos := saved
+        resume ()
+    | slice start ->
+        resume (substr (clone text) (Usz start) (Usz pos))
+    in
+        spaces ()
+        result = p ()
+        match peek ()
+        | Some _ -> fail ()
+        | None -> result
