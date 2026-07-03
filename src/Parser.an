@@ -72,34 +72,20 @@ parse_let {Fail} {Parse}: Expr =
     body = term ()
     Expr.Let name value body
 
-// ---------------------------------------------------------------------------
-// Pretty-printing
-// ---------------------------------------------------------------------------
-show_expr (e: Expr): String =
-    match e
-    | Unit -> "()"
-    | Identifier s -> s
-    | Lambda x body -> "(\\" ++ x ++ ". " ++ show_expr body ++ ")"
-    | FnCall f a -> "(" ++ show_expr f ++ " " ++ show_expr a ++ ")"
-    | Let x value body -> "let " ++ x ++ " = " ++ show_expr value ++ " in " ++ show_expr body
-
-impl print_expr: Print Expr with
-    print (e: Expr) = print (show_expr e)
-
-// ---------------------------------------------------------------------------
 parse_expr (text: String) {Fail}: Expr =
     parse term text
 
-show_parse (text: String): Unit =
-    output = show_expr (parse_expr (clone text)) ~> on_fail do "parse error"
-    print text
-    print "  ==>  "
-    println output
+// ---------------------------------------------------------------------------
+// Pretty-printing
+// ---------------------------------------------------------------------------
+impl cast_expr_string: Cast Expr String with
+    cast e =
+        match e
+        | Unit -> "()"
+        | Identifier s -> s
+        | Lambda x body -> "(\\${x}. ${body})"
+        | FnCall f a -> "(${f} ${a})"
+        | Let x value body -> "let ${x} = ${value} in ${body}"
 
-main () =
-    show_parse "\\x.x"
-    show_parse "let id = \\x.x in id id"
-    show_parse "\\x y z. x"
-    show_parse "(\\x. x) y"
-    show_parse "let compose = \\f g x. f (g x) in compose"
-    show_parse "let x = y"   // error: missing `in`
+impl print_expr: Print Expr with
+    print e = print (cast (deref e) : String)

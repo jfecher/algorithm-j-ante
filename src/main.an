@@ -18,14 +18,19 @@
 //
 //  Additionally, implementation of "levels" for efficient generalization is
 //  taken from http://okmij.org/ftp/ML/generalization.html
+//
+//  Algorithm J mutates type variables in place during unification (the `find` of
+//  union-find). In Ante this is expressed with `shared mut` types: a `TypeVar` is a
+//  heap cell that can be reassigned through any alias, so binding a variable during
+//  unification is visible everywhere that variable appears.
 import Std.Vec.Vec, stream_vec
-import Local.Parser.Expr
-import Std.HashMap.HashMap
-import Std.Fail.on_fail, Fail, fail
-import Std.Stream.stream_fn, map, Emit, emit
-import Std.Throw.Throw, throw
+import Local.Parser.Expr, parse_expr
+import Std.Fail.Fail, fail, try, on_fail
+import Std.Stream.Emit, emit, foldl, stream_fn
+import Std.String.eq_string
+import Std.IO.read_line
 
-type TypeVarId = U32
+type TypeVarId = I32
 type Level = U32
 
 shared type Type =
@@ -46,107 +51,121 @@ shared type Type =
     // Currying is also automatic
     | Fn Type Type
 
-shared type TypeVar =
+shared mut type TypeVar =
     | Bound Type
     | Unbound TypeVarId Level
 
 // Polytypes in the form  forall 'a 'b ... 'y . 'z
 // The typevar list will be a list of all monomorphic typevars in 'z
 // Used only in let-bindings to make the declaration polymorphic
-type PolyType =
+shared type PolyType =
     vars: Vec TypeVarId
     typ: Type
 
-shared type Context =
+shared mut type Context =
     current_level: U32 // = 1
-    current_typevar: U32 // = 0
+    current_typevar: I32 // = 0
 
-enter_level {var ctx: Context} =
+shared type List t =
+    | Nil
+    | Cons t (List t)
+
+lookup (list: List (k, v)) (key: k) {Eq k} {Fail}: v =
+    match list
+    | Nil -> fail ()
+    | Cons (k, v) rest -> if k == key then v else lookup rest key
+
+// A persistent (immutable) typing environment: an association list from names to
+// polytypes. Prepending is O(1) and naturally scoped, so nested lambda/let bindings
+// shadow correctly without copying a map.
+shared type Env = List (String, PolyType)
+
+
+enter_level (ctx: Context): Unit =
     ctx.current_level += 1
 
-exit_level {var ctx: Context} =
+exit_level (ctx: Context): Unit =
     ctx.current_level -= 1
 
-newvar {var ctx: Context} =
+newvar (ctx: Context): I32 =
     ctx.current_typevar += 1
     ctx.current_typevar
 
-newvar_t {ctx: Context} =
-    Type.Var (Unbound (newvar ()) ctx.current_level)
+newvar_t (ctx: Context): Type =
+    Type.Var (TypeVar.Unbound (newvar ctx) ctx.current_level)
 
 
-type TypeError = unit: Unit
+// A substitution from generalized variables to their fresh replacements, used by `inst`.
+shared type Subst = List (TypeVarId, Type)
 
 // specializes the polytype s by copying the term and replacing the
 // bound type variables consistently by new monotype variables
 // E.g.   inst (forall a b. a -> b -> a) = c -> d -> c
-inst (polytype: PolyType) {Context}: Type =
-    // Replace any typevars found in the Hashtbl with the
-    // associated value in the same table, leave them otherwise
-    replace_tvs tbl typ = match typ
+inst (ctx: Context) (polytype: PolyType): Type =
+    // Replace any typevars found in the substitution with the associated
+    // value, leave them otherwise
+    replace_tvs (s: Subst) (typ: Type): Type =
+        match typ
         | Type.Unit -> Type.Unit
-        | Var (Bound t) -> replace_tvs tbl t
-        | Var (Unbound n level) ->
-            typ = HashMap.get tbl n ~> on_fail do ref typ
-            typ.*
-        | Fn a b -> Fn (replace_tvs tbl a) (replace_tvs tbl b)
+        | Var (Bound t) -> replace_tvs s t
+        | Var (Unbound n _level) ->
+            // lookup n, defaulting to `typ` if it isn't in our map already
+            lookup s n ~> on_fail do typ
+        | Fn a b -> Fn (replace_tvs s a) (replace_tvs s b)
 
     // Note that the returned type is no longer a PolyType,
     // this means it is now monomorphic, the 'forall' is gone.
-    var tvs_to_replace = HashMap.empty ()
-    tvs_to_replace = HashMap.of (map polytype.vars do newvar_t ())
-    replace_tvs tvs_to_replace polytype.typ
+    subst = foldl polytype.vars List.Nil (fn acc v -> Cons (v, newvar_t ctx) acc)
+    replace_tvs subst polytype.typ
 
 
 // Can a monomorphic TVar(a) be found inside this type?
-occurs a_id a_level typ =
+occurs (a_id: TypeVarId) (a_level: Level) (typ: Type): Bool =
     match typ
     | Type.Unit -> false
     | Var (Bound t) -> occurs a_id a_level t
-    | Var (Unbound b_id b_level) -> // TODO: How to mutate with `@ b_typevar`
-        min_level = min a_level b_level
-        b_typevar := Unbound (b_id, min_level)
+    | Var (b @ Unbound b_id b_level) ->
+        min_level = if a_level < b_level then a_level else b_level
+        b := TypeVar.Unbound b_id min_level
         a_id == b_id
 
     | Fn b c -> occurs a_id a_level b or occurs a_id a_level c
 
 
-unify (t1: Type) (t2: Type) {Context} {Fail}: Unit =
-    match t1, t2
-    | (Unit, Unit) -> ()
+unify (ctx: Context) (t1: Type) (t2: Type) {Fail}: Unit =
+    match (t1, t2)
+    | (Type.Unit, Type.Unit) -> ()
 
     // These two recursive calls to the bound typevar replace
     // the 'find' in the union-find algorithm
-    | Var (Bound a), b -> unify a b
-    | a, Var (Bound b) -> unify a b
+    | (Var (Bound a), b) -> unify ctx a b
+    | (a, Var (Bound b)) -> unify ctx a b
 
-    | TVar (Unbound a_id a_level as a), b ->
+    | (Var (a @ Unbound a_id a_level), b) ->
         // create binding for boundTy that is currently empty
-        if t1 == t2 then () // a = a, but dont create a recursive binding to itself
-        else if occurs a_id a_level b then fail ()
-        else a := Bound b
+        if occurs a_id a_level b then fail ()
+        else a := TypeVar.Bound b
 
-    | a, TVar (Unbound b_id b_level as b) ->
+    | (a, Var (b @ Unbound b_id b_level)) ->
         // create binding for boundTy that is currently empty
-        if t1 == t2 then ()
-        else if occurs b_id b_level a then fail ()
-        else b := Bound a
+        if occurs b_id b_level a then fail ()
+        else b := TypeVar.Bound a
 
-    | Fn a b, Fn c d ->
-        unify a c
-        unify b d
+    | (Fn a b, Fn c d) ->
+        unify ctx a c
+        unify ctx b d
 
     | _ -> fail ()
 
 
 // Find all typevars and wrap the type in a PolyType
 // e.g.  generalize (a -> b -> b) = forall a b. a -> b -> b
-generalize (t: Type) {ctx: Context}: PolyType =
+generalize (ctx: Context) (t: Type): PolyType =
     // collect all the monomorphic typevars
-    find_all_tvs typ {Emit TypeVarId} =
+    find_all_tvs (typ: Type) {Emit TypeVarId}: Unit =
         match typ
         | Type.Unit -> ()
-        | Var (Bound t) -> find_all_tvs t
+        | Var (Bound t2) -> find_all_tvs t2
         | Var (Unbound n level) ->
             if level > ctx.current_level then emit n
         | Fn a b ->
@@ -154,7 +173,8 @@ generalize (t: Type) {ctx: Context}: PolyType =
             find_all_tvs b
 
     var vars = Vec.of (do find_all_tvs t)
-    vars.sort_dedup ()
+    vars.sort ()
+    vars.dedup ()
     PolyType vars t
 
 
@@ -169,8 +189,7 @@ dont_generalize (t: Type): PolyType =
 // The main entry point to type inference
 // All branches (except for the trivial Unit) of the first match in this function
 // are translated directly from the rules for algorithm J, given in comments
-// infer : polytype SMap.t -> Expr -> Type
-infer env expr {Fail} {Context} =
+infer (ctx: Context) (env: Env) (expr: Expr) {Fail}: Type =
     match expr
     | Expr.Unit -> Type.Unit
 
@@ -180,8 +199,8 @@ infer env expr {Fail} {Context} =
     //   -----------
     //   infer env x = t
     | Identifier x ->
-        s = HashMap.get env x
-        t = inst s
+        s = lookup env x
+        t = inst ctx s
         t
 
     // App
@@ -192,10 +211,10 @@ infer env expr {Fail} {Context} =
     //   ---------------
     //   infer env (f x) = t2
     | FnCall f x ->
-        t0 = infer env f
-        t1 = infer env x
-        t2 = newvar_t ()
-        unify t0 (Fn t1 t2)
+        t0 = infer ctx env f
+        t1 = infer ctx env x
+        t2 = newvar_t ctx
+        unify ctx t0 (Fn t1 t2)
         t2
 
     // Abs
@@ -204,11 +223,11 @@ infer env expr {Fail} {Context} =
     //   -------------
     //   infer env (fun x -> e) = t -> t2
     | Lambda x e ->
-        t = newvar_t ()
+        t = newvar_t ctx
         // t must be a polytype to go in our map, so make an empty forall
-        env2 = SMap.add x (dont_generalize t) env
-        t2 = infer env2 e
-        Fn(t, t2)
+        env2 = List.Cons (x, dont_generalize t) env
+        t2 = infer ctx env2 e
+        Fn t t2
 
     // Let
     //   infer env e0 = t
@@ -216,33 +235,22 @@ infer env expr {Fail} {Context} =
     //   -----------------
     //   infer env (let x = e0 in e1) = t2
     //
-    // enter/exit_level optimizations are from 
+    // enter/exit_level optimizations are from
     // http://okmij.org/ftp/ML/generalization.html
     // In this implementation, they're required so we
     // don't generalize types that escape into the environment.
     | Let x e0 e1 ->
-        enter_level ()
-        t = infer env e0
-        exit_level ()
-        t2 = infer (SMap.add x (generalize t) env) e1
+        enter_level ctx
+        t = infer ctx env e0
+        exit_level ctx
+        env2 = List.Cons (x, generalize ctx t) env
+        t2 = infer ctx env2 e1
         t2
 
 
-///////////////////////////////////////////////////////////////////////////////
-//                     front-end for parsing exprs on
-//                      the command line and showing
-//                           their computed types
-///////////////////////////////////////////////////////////////////////////////
-
-// Return the next unique lowercase-letter string after the given one, e.g: *)
-//   next_letter "'a" = "'b"
-//   next_letter "'b" = "'c"
-//   next_letter "'z" = "'{"   This can be fixed but most examples shouldn't have > 26 typevars anyway
-//
-next_letter (s: String) =
-    c = Bytes.get s 1 in
-    Bytes.set s 1 (Char (U8 c + 1))
-
+// ===========================================================================
+//     front-end: parse exprs, infer their types, and print the results
+// ===========================================================================
 
 // If this type is the a in a -> b, should it be parenthesized?
 // Note this is recursive in case bound typevars are used
@@ -252,62 +260,38 @@ should_parenthesize typ =
     | Fn _ _ -> true
     | _ -> false
 
-
 // pretty printing types
-string_of_type (t: Typ): String =
-    // Keep track of number to character bindings for typevars
-    // e.g. '2 => 'a, '5 => 'b, etc.
-    // Letters are assigned to typevars by the order in which the typevars
-    // appear in the type, left to right
-    loop (cur_typevar_name = "'a") (typevar_name_tbl = HashMap.empty ()) t ->
+// Unbound typevars are shown by their raw id
+// TODO: Sanitize type vars
+impl cast_type_string: Cast Type String with
+    cast t =
         match t
         | Type.Unit -> "unit"
-        | Var (Bound t2) -> recur cur_typevar_name typevar_name_tbl t2
-        | Var (Unbound n _) ->
-            match HashMap.get typevar_name_tbl n ~> try with
-            | Some s -> s
-            | None ->
-                typevar_name_tbl.insert n cur_typevar_name
-                next_letter cur_typevar_name
-                s
+        | Var (Bound t2) -> cast t2
+        | Var (Unbound n _level) -> "t${n}"
         | Fn a b ->
-            a_str = recur cur_typevar_name typevar_name_tbl a
-            b_str = recur cur_typevar_name typevar_name_tbl b
-            if should_parenthesize a then "(${a_str}) -> ${b_str}"
-            else "${a_str} -> ${b_str}"
+            if should_parenthesize a then "(${a}) -> ${b}"
+            else "${a} -> ${b}"
 
-print_type t =
-    print (string_of_type t)
-
-
-// The classic read-eval-printline-loop
 main () =
-    implicit ctx = Context with current_typevar = 0, current_level = 1
-    // TODO: throw type errors, variable not found errors, and parsing errors then convert this block
-    (try
-        print_string "> "
-        read_line ()
-        |> Lexer.parse
-        |> infer SMap.empty
-        |> print_type;
-        print_string "\n"
-    with
-       | TypeError -> print_endline "type error"
-       | Not_found -> print_endline "variable not found"
-       | Failure(s) -> print_endline "lexing failure, invalid symbol");
-    current_typevar := 0;
+    print "> "
+    line = read_line ()
+    ctx = Context 1 0
+    match try do infer ctx List.Nil (parse_expr line)
+    | Some t -> println (cast t : String)
+    | None -> println "type error"
     main ()
 
 // Tests
-// 
+//
 // 1:    \f.\x. f x  :  (a -> b) -> a -> b
 // 2:    \f.\x. f (f x) : (a -> a) -> a -> a
 // (+):  \m.\n.\f.\x. m f (n f x)  :  (a -> b -> c) -> (a -> d -> b) -> a -> d -> c
 // succ: \n.\f.\x. f (n f x)  :  ((a -> b) -> c -> a) -> (a -> b) -> c -> b
 // mult: \m.\n.\f.\x. m (n f) x  :  (a -> b -> c) -> (d -> a) -> d -> b -> c
 // pred: \n.\f.\x. n (\g.\h. h (g f)) (\u.x) (\u.u)  :  (((a -> b) -> (b -> c) -> c) -> (d -> e) -> (f -> f) -> g) -> a -> e -> g
-// 
+//
 // Let generalization tests
-// 
+//
 // \x. let y = x in y      : 'a -> 'a
 // \x. let y = \z.x in y   : 'a -> 'b -> 'a
