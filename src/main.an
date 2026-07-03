@@ -27,8 +27,10 @@ import Std.Vec.Vec, stream_vec
 import Local.Parser.Expr, parse_expr
 import Std.Fail.Fail, fail, try, on_fail
 import Std.Stream.Emit, emit, foldl, stream_fn
-import Std.String.eq_string
+import Std.String.eq_string, string_of
 import Std.IO.read_line
+import Std.HashMap.HashMap
+import Std.Hash.hash_i32
 
 type TypeVarId = I32
 type Level = U32
@@ -75,11 +77,6 @@ lookup (list: List (k, v)) (key: k) {Eq k} {Fail}: v =
     | Nil -> fail ()
     | Cons (k, v) rest -> if k == key then v else lookup rest key
 
-// A persistent (immutable) typing environment: an association list from names to
-// polytypes. Prepending is O(1) and naturally scoped, so nested lambda/let bindings
-// shadow correctly without copying a map.
-shared type Env = List (String, PolyType)
-
 
 enter_level (ctx: Context): Unit =
     ctx.current_level += 1
@@ -95,13 +92,13 @@ newvar_t (ctx: Context): Type =
     Type.Var (TypeVar.Unbound (newvar ctx) ctx.current_level)
 
 
-// A substitution from generalized variables to their fresh replacements, used by `inst`.
+// A substitution from generalized variables to their fresh replacements, used by `instantiate`.
 shared type Subst = List (TypeVarId, Type)
 
 // specializes the polytype s by copying the term and replacing the
 // bound type variables consistently by new monotype variables
-// E.g.   inst (forall a b. a -> b -> a) = c -> d -> c
-inst (ctx: Context) (polytype: PolyType): Type =
+// E.g.   instantiate (forall a b. a -> b -> a) = c -> d -> c
+instantiate (ctx: Context) (polytype: PolyType): Type =
     // Replace any typevars found in the substitution with the associated
     // value, leave them otherwise
     replace_tvs (s: Subst) (typ: Type): Type =
@@ -164,7 +161,7 @@ generalize (ctx: Context) (t: Type): PolyType =
     // collect all the monomorphic typevars
     find_all_tvs (typ: Type) {Emit TypeVarId}: Unit =
         match typ
-        | Type.Unit -> ()
+        | Unit -> ()
         | Var (Bound t2) -> find_all_tvs t2
         | Var (Unbound n level) ->
             if level > ctx.current_level then emit n
@@ -186,21 +183,24 @@ dont_generalize (t: Type): PolyType =
     PolyType (Vec.empty ()) t
 
 
+// The environment to store any names we already have a type for
+shared type Env = List (String, PolyType)
+
 // The main entry point to type inference
 // All branches (except for the trivial Unit) of the first match in this function
 // are translated directly from the rules for algorithm J, given in comments
 infer (ctx: Context) (env: Env) (expr: Expr) {Fail}: Type =
     match expr
-    | Expr.Unit -> Type.Unit
+    | Unit -> Type.Unit
 
     // Var
     //   x : s ∊ env
-    //   t = inst s
+    //   t = instantiate s
     //   -----------
     //   infer env x = t
     | Identifier x ->
         s = lookup env x
-        t = inst ctx s
+        t = instantiate ctx s
         t
 
     // App
@@ -219,7 +219,7 @@ infer (ctx: Context) (env: Env) (expr: Expr) {Fail}: Type =
 
     // Abs
     //   t = newvar ()
-    //   infer (SMap.add x t env) e = t2
+    //   infer (Cons (x, t) env) e = t2
     //   -------------
     //   infer env (fun x -> e) = t -> t2
     | Lambda x e ->
@@ -230,22 +230,22 @@ infer (ctx: Context) (env: Env) (expr: Expr) {Fail}: Type =
         Fn t t2
 
     // Let
-    //   infer env e0 = t
-    //   infer (SMap.add x (generalize t) env) e1 = t2
+    //   infer env e0 = t0
+    //   infer (Cons (x, generalize t) env) e1 = t1
     //   -----------------
-    //   infer env (let x = e0 in e1) = t2
+    //   infer env (let x = e0 in e1) = t1
     //
     // enter/exit_level optimizations are from
     // http://okmij.org/ftp/ML/generalization.html
-    // In this implementation, they're required so we
+    // In this implementation they're required so we
     // don't generalize types that escape into the environment.
     | Let x e0 e1 ->
         enter_level ctx
-        t = infer ctx env e0
+        t0 = infer ctx env e0
         exit_level ctx
-        env2 = List.Cons (x, generalize ctx t) env
-        t2 = infer ctx env2 e1
-        t2
+        env2 = List.Cons (x, generalize ctx t0) env
+        t1 = infer ctx env2 e1
+        t1
 
 
 // ===========================================================================
@@ -262,15 +262,23 @@ should_parenthesize typ =
 
 // pretty printing types
 // Unbound typevars are shown by their raw id
-// TODO: Sanitize type vars
 impl cast_type_string: Cast Type String with
-    cast t =
+    // Keep a hashmap to bind each type var we see to 'a', then 'b', 'c', etc.
+    cast t = loop t (vars: mut HashMap _ _ = mut HashMap.empty ()) ->
         match t
         | Type.Unit -> "unit"
-        | Var (Bound t2) -> cast t2
-        | Var (Unbound n _level) -> "t${n}"
+        | Var (Bound t2) -> recur t2 vars
+        | Var (Unbound n _level) ->
+            (HashMap.get vars n |> clone) ~> on_fail do
+                next_var = Char (Usz (U8 'a') + vars.len ())
+                next_var = string_of (do emit next_var)
+                vars.insert n (clone next_var)
+                next_var
         | Fn a b ->
-            if should_parenthesize a then "(${a}) -> ${b}"
+            parenthesize = should_parenthesize a
+            a = recur a vars
+            b = recur b vars
+            if parenthesize then "(${a}) -> ${b}"
             else "${a} -> ${b}"
 
 main () =
