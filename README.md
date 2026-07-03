@@ -1,7 +1,6 @@
 # algorithm-j
 
-> This is a work-in-progress translation of my [existing OCaml implementation](github.com/jfecher/algorithm-j)
-> in Ante. So far, only the parser is done!
+> This is a translation of my [existing OCaml implementation](github.com/jfecher/algorithm-j) in Ante
 
 A small implementation of [Algorithm J](https://en.wikipedia.org/wiki/Hindley%E2%80%93Milner_type_system#Algorithm_J)
 as described by J. Roger Hindley and Robin Milner. This is more efficient
