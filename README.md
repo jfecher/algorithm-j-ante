@@ -34,9 +34,11 @@ typing one will throw an exception, beware!
 
 ## Running
 
+Ensure git submodules are also cloned with `git submodule update --init --recursive`.
+
 Make sure [ante](github.com/jfecher/ante) is installed then run `ante run` to compile and run.
 
-Run `$ ./j` to start the REPL, type in any expression and get the type as a result, e.g:
+This will start the REPL. From there, type in any expression and get the type as a result, e.g:
 
 ```
 > \x.\y.x

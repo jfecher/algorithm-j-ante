@@ -1,8 +1,8 @@
 import Std.Fail.Fail, fail, on_fail, try
 import Std.Char.is_alpha
 import Std.String.eq_string
-import AParse.Parse.Parse, mark, reset, char_parser, literal, take_while1, optional, many1, fold1
-import AParse.Parse.map, keep_right, between, or_else, token, parse
+import AParser.Parse.Parse, mark, reset, char_parser, literal, take_while1, optional, many1, fold1
+import AParser.Parse.map, keep_right, between, or_else, token, parse
 
 shared type Expr =
    | Unit

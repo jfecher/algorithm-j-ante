@@ -1,0 +1,6 @@
+[submodule "deps/aparser"]
+	path = deps/aparser
+	url = https://github.com/jfecher/aparser
+[submodule "deps/AParser"]
+	path = deps/AParser
+	url = https://github.com/jfecher/AParser
